@@ -29,18 +29,18 @@ For quick testing without disk requirements, a **public RPC endpoint** is also s
 
 ## Environment Variables
 
-| Variable           | Required | Default                                   | Description                                                                |
-|--------------------|----------|-------------------------------------------|----------------------------------------------------------------------------|
-| `ETH_NODE_URL`     | yes      | `http://geth:8545`                        | Ethereum JSON-RPC endpoint (IPC path, `ws://`, `wss://`, or `http://` URL)|
-| `BATCH_SIZE`       | no       | `500` (local) / `100` (public)            | Number of `eth_getBalance` calls per JSON-RPC batch request                |
-| `RPC_CONCURRENCY`  | no       | `32` (local) / `4` (public)               | Number of concurrent batch requests in flight                              |
-| `KEYGEN_WORKERS`   | no       | `runtime.NumCPU()`                        | Number of goroutines generating key pairs                                  |
-| `DB_USERNAME`      | yes      | `${MYSQL_USER}`                           | MySQL username                                                             |
-| `DB_PASSWORD`      | yes      | `${MYSQL_PASSWORD}`                       | MySQL password                                                             |
-| `DB_HOST`          | yes      | `database`                                | MySQL host                                                                 |
-| `DB_PORT`          | yes      | `3306`                                    | MySQL port                                                                 |
-| `DB_SCHEMA`        | yes      | `${MYSQL_DATABASE}`                       | MySQL database name                                                        |
-| `SERVER_PORT`      | yes      | `8080`                                    | HTTP health-check port                                                     |
+| Variable           | Required | Default      | Description                                                                |
+|--------------------|----------|--------------|----------------------------------------------------------------------------|
+| `ETH_NODE_URL`     | yes      | `http://geth:8545` | Ethereum JSON-RPC endpoint (IPC path, `ws://`, `wss://`, or `http://` URL)|
+| `BATCH_SIZE`       | no       | `500`        | Number of `eth_getBalance` calls per JSON-RPC batch request. **Set to `100` for public RPC mode.** |
+| `RPC_CONCURRENCY`  | no       | `32`         | Number of concurrent batch requests in flight. **Set to `4` for public RPC mode.** |
+| `KEYGEN_WORKERS`   | no       | `runtime.NumCPU()` | Number of goroutines generating key pairs                             |
+| `DB_USERNAME`      | yes      | `${MYSQL_USER}`    | MySQL username                                                        |
+| `DB_PASSWORD`      | yes      | `${MYSQL_PASSWORD}` | MySQL password                                                       |
+| `DB_HOST`          | yes      | `database`   | MySQL host                                                                 |
+| `DB_PORT`          | yes      | `3306`       | MySQL port                                                                 |
+| `DB_SCHEMA`        | yes      | `${MYSQL_DATABASE}` | MySQL database name                                                   |
+| `SERVER_PORT`      | yes      | `8080`       | HTTP health-check port                                                     |
 
 
 ## Deploy

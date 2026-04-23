@@ -352,12 +352,11 @@ func queryBatch(
 			}
 		}
 		if hasRateLimit {
-			// Reset per-element errors so we retry all elements.
+			// Reset only the per-element error field; reuse the existing result pointers.
 			for i := range elems {
 				elems[i].Error = nil
-				s := new(string)
-				results[i] = s
-				elems[i].Result = s
+				// Reset the result string so stale data is not read on retry.
+				*results[i] = ""
 			}
 			delay := backoffDelay(attempt, baseDelay, maxDelay)
 			logrus.WithFields(logrus.Fields{
@@ -430,6 +429,8 @@ func isTransientError(err error) bool {
 }
 
 // backoffDelay computes an exponential backoff duration with ±25% jitter.
+// rand.Int63n is safe for concurrent use in Go 1.20+ (global source is automatically
+// seeded and goroutine-safe).
 func backoffDelay(attempt int, base, max time.Duration) time.Duration {
 	exp := base
 	for i := 0; i < attempt; i++ {
