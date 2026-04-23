@@ -5,10 +5,12 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"math/big"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -290,6 +292,8 @@ func batchWorker(
 
 // queryBatch sends a single JSON-RPC batch request for eth_getBalance on all
 // provided addresses and forwards accounts with non-zero balance to resultCh.
+// It retries on transient errors (HTTP 429, connection reset, JSON-RPC -32005)
+// using exponential backoff with jitter (max 5 attempts).
 func queryBatch(
 	ctx context.Context,
 	rpcClient *ethrpc.Client,
@@ -298,6 +302,10 @@ func queryBatch(
 	totalKeys *atomic.Int64,
 	rpcErrors *atomic.Int64,
 ) {
+	const maxRetries = 5
+	const baseDelay = 500 * time.Millisecond
+	const maxDelay = 30 * time.Second
+
 	elems := make([]ethrpc.BatchElem, len(keys))
 	results := make([]*string, len(keys))
 	for i := range keys {
@@ -310,31 +318,138 @@ func queryBatch(
 		}
 	}
 
-	if err := rpcClient.BatchCallContext(ctx, elems); err != nil {
-		rpcErrors.Add(1)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
+
+		err := rpcClient.BatchCallContext(ctx, elems)
+		if err != nil {
+			if isRateLimitError(err) || isTransientError(err) {
+				delay := backoffDelay(attempt, baseDelay, maxDelay)
+				logrus.WithFields(logrus.Fields{
+					"attempt": attempt + 1,
+					"delay":   delay,
+					"error":   err,
+				}).Warn("RPC batch error, retrying with backoff")
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
+			rpcErrors.Add(1)
+			return
+		}
+
+		// Check for per-element rate-limit errors and retry the whole batch.
+		hasRateLimit := false
+		for _, elem := range elems {
+			if elem.Error != nil && isRateLimitError(elem.Error) {
+				hasRateLimit = true
+				break
+			}
+		}
+		if hasRateLimit {
+			// Reset only the per-element error field; reuse the existing result pointers.
+			for i := range elems {
+				elems[i].Error = nil
+				// Reset the result string so stale data is not read on retry.
+				*results[i] = ""
+			}
+			delay := backoffDelay(attempt, baseDelay, maxDelay)
+			logrus.WithFields(logrus.Fields{
+				"attempt": attempt + 1,
+				"delay":   delay,
+			}).Warn("RPC rate limit hit, retrying batch with backoff")
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+
+		// Batch call succeeded — process results.
+		totalKeys.Add(int64(len(keys)))
+		for i, elem := range elems {
+			if elem.Error != nil {
+				rpcErrors.Add(1)
+				continue
+			}
+			hexStr := *results[i]
+			wei := parseHexBalance(hexStr)
+			if wei == nil || wei.Sign() == 0 {
+				continue
+			}
+			ki := keys[i]
+			resultCh <- Account{
+				PrivateKey: hexutil.Encode(crypto.FromECDSA(ki.privateKey)),
+				PublicKey:  hexutil.Encode(ki.publicKeyBytes),
+				Address:    ki.address,
+				Balance:    weiToEther(wei),
+			}
+		}
 		return
 	}
 
-	totalKeys.Add(int64(len(keys)))
+	// All retries exhausted — log and discard the batch.
+	rpcErrors.Add(1)
+	logrus.WithField("batch_size", len(keys)).Warn("batch discarded after max retries")
+}
 
-	for i, elem := range elems {
-		if elem.Error != nil {
-			rpcErrors.Add(1)
-			continue
-		}
-		hexStr := *results[i]
-		wei := parseHexBalance(hexStr)
-		if wei == nil || wei.Sign() == 0 {
-			continue
-		}
-		ki := keys[i]
-		resultCh <- Account{
-			PrivateKey: hexutil.Encode(crypto.FromECDSA(ki.privateKey)),
-			PublicKey:  hexutil.Encode(ki.publicKeyBytes),
-			Address:    ki.address,
-			Balance:    weiToEther(wei),
+// isRateLimitError returns true for HTTP 429 responses and JSON-RPC error codes
+// that indicate rate limiting (-32005 "limit exceeded" or -32029).
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, keyword := range []string{"-32005", "-32029", "429", "too many requests", "rate limit", "rate-limit", "limit exceeded"} {
+		if strings.Contains(msg, keyword) {
+			return true
 		}
 	}
+	return false
+}
+
+// isTransientError returns true for errors that are likely temporary and worth retrying.
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, keyword := range []string{"connection reset", "eof", "broken pipe", "timeout", "context deadline exceeded", "i/o timeout"} {
+		if strings.Contains(msg, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// backoffDelay computes an exponential backoff duration with ±25% jitter.
+// rand.Int63n is safe for concurrent use in Go 1.20+ (global source is automatically
+// seeded and goroutine-safe).
+func backoffDelay(attempt int, base, max time.Duration) time.Duration {
+	exp := base
+	for i := 0; i < attempt; i++ {
+		exp *= 2
+		if exp > max {
+			exp = max
+			break
+		}
+	}
+	// Add ±25% jitter.
+	jitter := time.Duration(rand.Int63n(int64(exp/2))) - exp/4
+	d := exp + jitter
+	if d < base {
+		d = base
+	}
+	if d > max {
+		d = max
+	}
+	return d
 }
 
 // generateKeyInfo generates a new Ethereum key pair and returns the associated keyInfo.
