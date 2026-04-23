@@ -1,0 +1,133 @@
+services:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Database (MySQL) — always active in both profiles
+  # ─────────────────────────────────────────────────────────────────────────────
+  database:
+    image: mysql:8
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-Ethereum}
+      MYSQL_USER: ${MYSQL_USER:-app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-app}
+    volumes:
+      - database_data:/var/lib/mysql
+    networks:
+      - net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root",
+             "--password=${MYSQL_ROOT_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    labels:
+      - homepage.group=Services
+      - homepage.name=MySQL
+      - homepage.icon=mysql.png
+      - homepage.description=MySQL Database
+      - homepage.showStats=true
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Homepage dashboard — always active in both profiles
+  # ─────────────────────────────────────────────────────────────────────────────
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    restart: unless-stopped
+    ports:
+      - "${HOMEPAGE_PORT:-3000}:3000"
+    volumes:
+      - ./Homepage/config:/app/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - net
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Geth — only in "local" profile
+  # Start with: docker compose --profile local up -d --build
+  # ─────────────────────────────────────────────────────────────────────────────
+  geth:
+    image: ethereum/client-go:stable
+    profiles: ["local"]
+    restart: unless-stopped
+    command:
+      - --syncmode=snap
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=eth,net,web3
+      - --http.vhosts=*
+      - --state.scheme=path
+      - --history.state=0
+      - --history.transactions=0
+    ports:
+      - "${GETH_HTTP_PORT:-8545}:8545"
+      - "${GETH_WS_PORT:-8546}:8546"
+    volumes:
+      - geth_data:/root/.ethereum
+    networks:
+      - net
+    healthcheck:
+      test: ["CMD-SHELL",
+             "wget -qO- --post-data='{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}' \
+              --header='Content-Type: application/json' http://localhost:8545 \
+              | grep -q '\"result\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    labels:
+      - homepage.group=Services
+      - homepage.name=Geth
+      - homepage.icon=ethereum.png
+      - homepage.description=Ethereum full node
+      - homepage.showStats=true
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Wallet — always active in both profiles
+  # For "local" profile: ETH_NODE_URL defaults to http://geth:8545
+  # For "public" profile: set ETH_NODE_URL (and optionally BATCH_SIZE /
+  #   RPC_CONCURRENCY) in .env — see .env.example for recommended values.
+  # restart: unless-stopped handles the case where geth is still starting.
+  # ─────────────────────────────────────────────────────────────────────────────
+  wallet:
+    build:
+      context: .
+      dockerfile: image/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      database:
+        condition: service_healthy
+    ports:
+      - "${WALLET_PORT:-8080}:8080"
+    environment:
+      DB_USERNAME: ${MYSQL_USER:-app}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-app}
+      DB_HOST: database
+      DB_PORT: 3306
+      DB_SCHEMA: ${MYSQL_DATABASE:-Ethereum}
+      SERVER_PORT: 8080
+      # ETH_NODE_URL: set in .env.
+      #   local mode  → http://geth:8545  (default)
+      #   public mode → https://ethereum-rpc.publicnode.com  (set explicitly)
+      ETH_NODE_URL: ${ETH_NODE_URL:-http://geth:8545}
+      BATCH_SIZE: ${BATCH_SIZE:-500}
+      RPC_CONCURRENCY: ${RPC_CONCURRENCY:-32}
+      # KEYGEN_WORKERS: ${KEYGEN_WORKERS:-0}  # 0 = runtime.NumCPU()
+    networks:
+      - net
+    labels:
+      - homepage.group=Services
+      - homepage.name=Ethereum Wallet
+      - homepage.icon=go.svg
+      - homepage.href=http://localhost:${WALLET_PORT:-8080}/health
+      - homepage.description=Wallet key scanner
+      - homepage.showStats=true
+
+volumes:
+  database_data:
+  geth_data:
+
+networks:
+  net:

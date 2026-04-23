@@ -5,93 +5,87 @@
 
 ## Introduction
 
-This Go program generates Ethereum key pairs at maximum speed, checks their balances via a **local Ethereum full node**, and stores accounts with a non-zero balance in a MySQL database.
-
-> **This tool requires a local Ethereum full node. Public RPC endpoints are not supported and would make the scan effectively useless due to rate limits.**
+This Go program generates Ethereum key pairs at maximum speed, checks their balances via an Ethereum JSON-RPC node, and stores accounts with a non-zero balance in a MySQL database.
 
 Balance queries are sent in batches via `eth_getBalance` JSON-RPC `BatchCallContext`, eliminating per-request HTTP overhead.
+For best performance use a **local Ethereum full node** (Option A below).
+For quick testing without disk requirements, a **public RPC endpoint** is also supported (Option B).
 
 
 ## Prerequisites
 
-- Golang 1.22
-```bash
-$ snap install go --classic
-```
-- Docker & Docker Swarm https://docs.docker.com/engine/install
-- A **local Ethereum full node** — [Erigon](https://github.com/erigontech/erigon) is recommended for superior random-state-access performance (MDBX flat storage). Geth also works.
-  - Erigon quickstart: https://docs.erigon.tech/getting-started/install
-  - Ensure the node is fully synced and either:
-    - The IPC socket is accessible (e.g. `/data/erigon/ethereum/geth.ipc`) — **preferred, lowest latency**
-    - Or the JSON-RPC HTTP/WebSocket endpoint is reachable (e.g. `http://127.0.0.1:8545`)
+### Common requirements
+- Docker & Docker Compose v2: https://docs.docker.com/engine/install
+
+### Option A — Local geth node
+- ~500 GB free NVMe SSD (required for Ethereum state)
+- First sync takes 1–3 days; geth runs inside the compose stack
+
+### Option B — Public RPC endpoint
+- No SSD required
+- An internet-accessible JSON-RPC endpoint (default: `https://ethereum-rpc.publicnode.com`, no API key)
+- Optional: API key for Alchemy / Infura / QuickNode for higher throughput
 
 
 ## Environment Variables
 
-| Variable          | Required | Default            | Description                                                                 |
-|-------------------|----------|--------------------|-----------------------------------------------------------------------------|
-| `DB_USERNAME`     | yes      | —                  | MySQL username                                                              |
-| `DB_PASSWORD`     | yes      | —                  | MySQL password                                                              |
-| `DB_HOST`         | yes      | —                  | MySQL host                                                                  |
-| `DB_PORT`         | yes      | —                  | MySQL port                                                                  |
-| `DB_SCHEMA`       | yes      | —                  | MySQL database name                                                         |
-| `SERVER_PORT`     | yes      | —                  | HTTP health-check port                                                      |
-| `ETH_NODE_URL`    | yes      | —                  | Local Ethereum node: IPC path, `ws://`, `wss://`, or `http://` URL         |
-| `BATCH_SIZE`      | no       | `500`              | Number of `eth_getBalance` calls per JSON-RPC batch request                |
-| `RPC_CONCURRENCY` | no       | `32`               | Number of concurrent batch requests in flight                              |
-| `KEYGEN_WORKERS`  | no       | `runtime.NumCPU()` | Number of goroutines generating key pairs                                  |
+| Variable           | Required | Default                                   | Description                                                                |
+|--------------------|----------|-------------------------------------------|----------------------------------------------------------------------------|
+| `ETH_NODE_URL`     | yes      | `http://geth:8545`                        | Ethereum JSON-RPC endpoint (IPC path, `ws://`, `wss://`, or `http://` URL)|
+| `BATCH_SIZE`       | no       | `500` (local) / `100` (public)            | Number of `eth_getBalance` calls per JSON-RPC batch request                |
+| `RPC_CONCURRENCY`  | no       | `32` (local) / `4` (public)               | Number of concurrent batch requests in flight                              |
+| `KEYGEN_WORKERS`   | no       | `runtime.NumCPU()`                        | Number of goroutines generating key pairs                                  |
+| `DB_USERNAME`      | yes      | `${MYSQL_USER}`                           | MySQL username                                                             |
+| `DB_PASSWORD`      | yes      | `${MYSQL_PASSWORD}`                       | MySQL password                                                             |
+| `DB_HOST`          | yes      | `database`                                | MySQL host                                                                 |
+| `DB_PORT`          | yes      | `3306`                                    | MySQL port                                                                 |
+| `DB_SCHEMA`        | yes      | `${MYSQL_DATABASE}`                       | MySQL database name                                                        |
+| `SERVER_PORT`      | yes      | `8080`                                    | HTTP health-check port                                                     |
 
 
-## Deploy Ethereum Wallet
+## Deploy
 
-#### Clone the repository into a local directory
-
-```bash
-$ git clone https://github.com/palmatovic/ethereum-wallet.git
-```
-
-
-#### Navigate to the project directory:
+Copy the environment template and edit as needed:
 
 ```bash
-$ cd ethereum-wallet
+cp .env.example .env
+# edit .env as needed
 ```
 
-#### Build image
-```bash
-$ docker build -t wallet:latest -f image/Dockerfile .
-```
+### Option A — Local geth node (recommended, requires ~500 GB NVMe SSD)
 
-#### Review ethereum.yml, replace following values
-``` bash
-- <YOUR_LOCALNET_IP>
-- <SERVER_PORT>
-- <ETH_NODE_URL>   # e.g. /data/erigon/ethereum/geth.ipc  or  http://127.0.0.1:8545
-```
-
-#### Deploy
-```bash
-$ docker stack deploy -c docker/ethereum.yml ethereum
-```
-
-
-## Optional - Dashboard
-
-#### Clone the repository into a local directory
+Runs a self-hosted geth inside the compose stack.
+First sync takes 1–3 days.
+Highest throughput (~500k–1M balance checks/s with batching).
 
 ```bash
-$ cd Homepage
+docker compose --profile local up -d --build
 ```
 
-#### Review homepage.yml, replace following value
-``` bash
-- <UI_PORT>
+> **Note**: Leave `ETH_NODE_URL=http://geth:8545` (the default) in `.env`.
+> `BATCH_SIZE=500` and `RPC_CONCURRENCY=32` are the recommended defaults for a local node.
+
+### Option B — Public RPC (demo / quick start, no SSD required)
+
+Uses a remote JSON-RPC endpoint (default: `publicnode.com`, no API key).
+Throughput is limited to ~5k–10k checks/s by the provider's rate limits.
+For higher throughput, set `PUBLIC_ETH_NODE_URL` in `.env` to an Alchemy/Infura URL.
+
+In `.env`, set:
+```
+ETH_NODE_URL=https://ethereum-rpc.publicnode.com
+BATCH_SIZE=100
+RPC_CONCURRENCY=4
 ```
 
-#### Deploy
+Then run:
 ```bash
-$ docker stack deploy -c homepage.yml homepage
+docker compose --profile public up -d --build
 ```
+
+> **Note**: public RPC providers may rate-limit or ban automated scanning.
+> This mode is intended for testing and demos, not for serious key-space exploration.
+> The wallet client automatically retries on HTTP 429 / JSON-RPC -32005 with exponential backoff.
 
 
 ## Disclaimer
