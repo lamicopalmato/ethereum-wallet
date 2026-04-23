@@ -39,6 +39,21 @@ services:
       DB_PORT: 3306
       DB_SCHEMA: Ethereum
       SERVER_PORT: 8080
+      # ETH_NODE_URL is required. Use an IPC socket path for best performance, e.g.:
+      #   /data/erigon/ethereum/geth.ipc  (Erigon, recommended)
+      #   /data/geth/geth.ipc             (Geth)
+      # Or an HTTP/WebSocket URL for a local node:
+      #   http://127.0.0.1:8545
+      #   ws://127.0.0.1:8546
+      ETH_NODE_URL: /data/erigon/ethereum/geth.ipc
+      BATCH_SIZE: 500
+      RPC_CONCURRENCY: 32
+      # KEYGEN_WORKERS defaults to runtime.NumCPU() when unset or 0
+      # KEYGEN_WORKERS: 8
+    # To use an IPC socket, mount the node's data directory (or the socket itself)
+    # as a read-only volume so the container can reach the Unix socket:
+    # volumes:
+    #   - /data/erigon/ethereum:/data/erigon/ethereum:ro
     labels:
       - homepage.group=Services
       - homepage.name=Ethereum Wallet

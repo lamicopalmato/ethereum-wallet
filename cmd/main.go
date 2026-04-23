@@ -1,30 +1,32 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"crypto/ecdsa"
-	"encoding/json"
-	"github.com/gorilla/mux"
-
 	"fmt"
+	"math/big"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
 	"github.com/caarlos0/env/v6"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/sirupsen/logrus"
-	sql "gorm.io/driver/mysql"
-
+	ethrpc "github.com/ethereum/go-ethereum/rpc"
 	"github.com/go-sql-driver/mysql"
+	"github.com/gorilla/mux"
+	"github.com/sirupsen/logrus"
+	sqld "gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
-	"io"
-	"math"
-	"net/http"
-	"strconv"
-	"sync"
-	"time"
 )
 
-// Account rappresenta un account Ethereum
+// Account represents an Ethereum account stored in the database.
 type Account struct {
 	PrivateKey string
 	PublicKey  string
@@ -33,45 +35,28 @@ type Account struct {
 	gorm.Model
 }
 
+// Environment holds all runtime configuration from environment variables.
 type Environment struct {
-	DBUsername string `env:"DB_USERNAME,required"`
-	DBPassword string `env:"DB_PASSWORD,required"`
-	DBHost     string `env:"DB_HOST,required"`
-	DBPort     int    `env:"DB_PORT,required"`
-	DBSchema   string `env:"DB_SCHEMA,required"`
-	ServerPort int    `env:"SERVER_PORT,required"`
+	DBUsername     string `env:"DB_USERNAME,required"`
+	DBPassword     string `env:"DB_PASSWORD,required"`
+	DBHost         string `env:"DB_HOST,required"`
+	DBPort         int    `env:"DB_PORT,required"`
+	DBSchema       string `env:"DB_SCHEMA,required"`
+	ServerPort     int    `env:"SERVER_PORT,required"`
+	EthNodeURL     string `env:"ETH_NODE_URL,required"`
+	BatchSize      int    `env:"BATCH_SIZE" envDefault:"500"`
+	RPCConcurrency int    `env:"RPC_CONCURRENCY" envDefault:"32"`
+	KeygenWorkers  int    `env:"KEYGEN_WORKERS" envDefault:"0"`
 }
 
-func main() {
-
-	var err error
-	var e Environment
-	if err = env.Parse(&e); err != nil {
-		logrus.WithError(err).Panic("cannot configure environment variables")
-	}
-	db := initDatabase(databaseConfig{
-		Username: e.DBUsername,
-		Password: e.DBPassword,
-		Address:  e.DBHost,
-		Port:     e.DBPort,
-		Name:     e.DBSchema,
-	})
-
-	router := mux.NewRouter()
-	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		if _, err = w.Write([]byte(`"message":"running"`)); err != nil {
-			return
-		}
-	})
-
-	go process(db)
-
-	if err = http.ListenAndServe(fmt.Sprintf(":%d", e.ServerPort), router); err != nil {
-		panic(err)
-	}
+// keyInfo holds the generated key material for a single Ethereum address.
+type keyInfo struct {
+	privateKey     *ecdsa.PrivateKey
+	publicKeyBytes []byte
+	address        string
 }
 
+// databaseConfig holds the database connection parameters.
 type databaseConfig struct {
 	Username string
 	Password string
@@ -80,150 +65,328 @@ type databaseConfig struct {
 	Name     string
 }
 
-func process(db *gorm.DB) {
-	var err error
-	urls := []string{
-		"https://cloudflare-eth.com",
-		"https://rpc.flashbots.net/",
-		"https://rpc.ankr.com/eth",
-		"https://eth-mainnet.public.blastapi.io",
-		"https://api.securerpc.com/v1",
-		"https://1rpc.io/eth",
-		"https://ethereum.publicnode.com",
-		"https://rpc.payload.de",
-		"https://eth.api.onfinality.io/public",
-		"https://eth.merkle.io",
-		"https://eth.drpc.org",
-		"https://public.stackup.sh/api/v1/node/ethereum-mainnet",
-		"https://eth.llamarpc.com",
-		"https://ethereum.blockpi.network/v1/rpc/public",
-		"https://ethereum-rpc.publicnode.com",
-		"https://rpc.eth.gateway.fm",
-		"https://mainnet.gateway.tenderly.co",
-		"https://gateway.tenderly.co/public/mainnet",
-		"https://uk.rpc.blxrbdn.com",
-		"https://go.getblock.io/d9fde9abc97545f4887f56ae54f3c2c0",
-		"https://singapore.rpc.blxrbdn.com",
-		"https://eth.meowrpc.com",
-		"https://rpc.mevblocker.io/fast",
-		"https://rpc.mevblocker.io",
-		"https://eth.rpc.blxrbdn.com",
-		"https://virginia.rpc.blxrbdn.com",
-		"https://core.gashawk.io/rpc",
-		"https://api.stateless.solutions/ethereum/v1/demo",
-		"https://api.tatum.io/v3/blockchain/node/ethereum-mainnet",
-		"https://rpc.flashbots.net/fast",
-		"https://rpc.flashbots.net",
-		"https://eth.nodeconnect.org",
-		"https://eth-pokt.nodies.app",
-		"https://gateway.subquery.network/rpc/eth",
-		"https://rpc.mevblocker.io/fullprivacy",
-		"https://rpc.mevblocker.io/noreverts",
-		"https://ethereum.rpc.subquery.network/public",
-		"https://rpc.builder0x69.io",
-		"https://rpc.blocknative.com/boost",
-		"https://services.tokenview.io/vipapi/nodeservice/eth?apikey=qVHq2o6jpaakcw3lRstl",
-		"https://rpc.tenderly.co/fork/c63af728-a183-4cfb-b24e-a92801463484",
-		"https://eth-mainnet.g.alchemy.com/v2/demo",
-		"https://openapi.bitstack.com/v1/wNFxbiJyQsSeLrX8RRCHi7NpRxrlErZk/DjShIqLishPCTB9HiMkPHXjUM9CNM9Na/ETH/mainnet",
-		"https://endpoints.omniatech.io/v1/eth/mainnet/public",
-		"https://eth-mainnet.nodereal.io/v1/1659dfb40aa24bbb8153a677b98064d7",
+func main() {
+	var e Environment
+	if err := env.Parse(&e); err != nil {
+		logrus.WithError(err).Panic("cannot configure environment variables")
+	}
+	if e.KeygenWorkers <= 0 {
+		e.KeygenWorkers = runtime.NumCPU()
 	}
 
-	resultChannel := make(chan Account)
-	go func() {
-		for account := range resultChannel {
-			if account.Balance > 0 {
-				logrus.WithFields(
-					logrus.Fields{
-						"private_key": account.PrivateKey,
-						"public_key":  account.PublicKey,
-						"address":     account.Address,
-						"balance":     account.Balance,
-					}).Infof("found account")
-				if err = db.Create(&account).Error; err != nil {
-					logrus.WithError(err).Errorf("error during create account")
+	db := initDatabase(databaseConfig{
+		Username: e.DBUsername,
+		Password: e.DBPassword,
+		Address:  e.DBHost,
+		Port:     e.DBPort,
+		Name:     e.DBSchema,
+	})
+	sqlDB, _ := db.DB()
+
+	// Connect to the local Ethereum node (IPC path, ws://, or http://).
+	// rpc.Dial selects the transport based on the URL prefix.
+	rpcClient, err := ethrpc.Dial(e.EthNodeURL)
+	if err != nil {
+		logrus.WithError(err).Panicf("cannot connect to Ethereum node at %s", e.EthNodeURL)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Capture SIGINT / SIGTERM for graceful shutdown.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	keygenCh := make(chan keyInfo, e.BatchSize*e.RPCConcurrency*2)
+	resultCh := make(chan Account, 256)
+
+	var wgKeygen sync.WaitGroup
+	var wgBatcher sync.WaitGroup
+	var wgWriter sync.WaitGroup
+
+	var totalKeys atomic.Int64
+	var totalHits atomic.Int64
+	var rpcErrors atomic.Int64
+	var prevKeys int64
+
+	startTime := time.Now()
+
+	// --- Keygen workers ---
+	for i := 0; i < e.KeygenWorkers; i++ {
+		wgKeygen.Add(1)
+		go func() {
+			defer wgKeygen.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
 				}
+				ki, genErr := generateKeyInfo()
+				if genErr != nil {
+					logrus.WithError(genErr).Error("error generating key")
+					continue
+				}
+				select {
+				case keygenCh <- ki:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	// Close keygenCh once all keygen workers have exited.
+	go func() {
+		wgKeygen.Wait()
+		close(keygenCh)
+	}()
+
+	// --- Batcher workers ---
+	for i := 0; i < e.RPCConcurrency; i++ {
+		wgBatcher.Add(1)
+		go func() {
+			defer wgBatcher.Done()
+			batchWorker(ctx, rpcClient, keygenCh, resultCh, e.BatchSize, &totalKeys, &rpcErrors)
+		}()
+	}
+
+	// Close resultCh once all batcher workers have exited.
+	go func() {
+		wgBatcher.Wait()
+		close(resultCh)
+	}()
+
+	// --- DB writer ---
+	wgWriter.Add(1)
+	go func() {
+		defer wgWriter.Done()
+		for account := range resultCh {
+			totalHits.Add(1)
+			logrus.WithFields(logrus.Fields{
+				"private_key": account.PrivateKey,
+				"public_key":  account.PublicKey,
+				"address":     account.Address,
+				"balance":     account.Balance,
+			}).Info("found account with balance")
+			if dbErr := db.Create(&account).Error; dbErr != nil {
+				logrus.WithError(dbErr).Error("error saving account to database")
 			}
 		}
 	}()
 
-	var mu sync.Mutex
-	usedUrls := make(map[string]bool)
-	markUsed := func(url string) {
-		mu.Lock()
-		defer mu.Unlock()
-		usedUrls[url] = true
-	}
-	markUnused := func(url string) {
-		mu.Lock()
-		defer mu.Unlock()
-		usedUrls[url] = false
-	}
-	isUsed := func(url string) bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return usedUrls[url]
-	}
-	var semaphore = make(chan struct{}, len(urls))
-	var wg sync.WaitGroup
-	var success int64
+	// --- Metrics ticker ---
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
 	go func() {
 		for {
 			select {
 			case <-ticker.C:
-				fmt.Printf("success: %e\n", float64(success))
+				now := totalKeys.Load()
+				elapsed := time.Since(startTime).Seconds()
+				avg := float64(now) / elapsed
+				inst := float64(now-prevKeys) / (2 * 60)
+				prevKeys = now
+				fmt.Printf(
+					"[metrics] keys/s (inst=%.0f avg=%.0f) total=%d hits=%d rpc_errors=%d\n",
+					inst, avg, now, totalHits.Load(), rpcErrors.Load(),
+				)
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
 
-	for {
-		wg.Add(1)
-		semaphore <- struct{}{} // Acquire semaphore
-		go func() {
-			defer func() {
-				<-semaphore // Release semaphore
-				wg.Done()
-			}()
-			var errGoRoutine error
-			var privateKey *ecdsa.PrivateKey
-			if privateKey, errGoRoutine = generatePrivateKey(); errGoRoutine != nil {
-				logrus.WithError(err).Errorf("error generating private key")
-				return
-			}
-			var address string
-			var publicKeyBytes []byte
-			if address, publicKeyBytes, errGoRoutine = getAddressAndPublicKey(privateKey); errGoRoutine != nil {
-				logrus.WithError(errGoRoutine).Errorf("error generating address and public key")
-				return
-			}
-			var balanceInEther float64
-			for {
-				for _, url := range urls {
-					if !isUsed(url) {
-						markUsed(url)
-						balanceInEther, err = getAccountBalance(url, address)
-						markUnused(url)
-						if err == nil {
-							break
-						}
-					}
-				}
-				if err == nil {
-					success++
-					break
-				}
-			}
-			resultChannel <- Account{
-				PrivateKey: hexutil.Encode(crypto.FromECDSA(privateKey)),
-				PublicKey:  hexutil.Encode(publicKeyBytes),
-				Address:    address,
-				Balance:    balanceInEther,
-			}
-		}()
+	// --- HTTP health endpoint ---
+	router := mux.NewRouter()
+	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"message":"running"}`))
+	})
+	srv := &http.Server{
+		Addr:    fmt.Sprintf(":%d", e.ServerPort),
+		Handler: router,
 	}
+	go func() {
+		if srvErr := srv.ListenAndServe(); srvErr != nil && srvErr != http.ErrServerClosed {
+			logrus.WithError(srvErr).Error("HTTP server error")
+		}
+	}()
+
+	// Wait for shutdown signal.
+	<-sigCh
+	logrus.Info("shutting down...")
+	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	_ = srv.Shutdown(shutdownCtx)
+
+	wgKeygen.Wait()
+	wgBatcher.Wait()
+	wgWriter.Wait()
+
+	rpcClient.Close()
+	if sqlDB != nil {
+		_ = sqlDB.Close()
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"total_keys": totalKeys.Load(),
+		"total_hits": totalHits.Load(),
+	}).Info("shutdown complete")
+}
+
+// batchWorker collects keyInfo items from keygenCh in batches and issues a single
+// BatchCallContext request per batch against the Ethereum node.
+func batchWorker(
+	ctx context.Context,
+	rpcClient *ethrpc.Client,
+	keygenCh <-chan keyInfo,
+	resultCh chan<- Account,
+	batchSize int,
+	totalKeys *atomic.Int64,
+	rpcErrors *atomic.Int64,
+) {
+	batch := make([]keyInfo, 0, batchSize)
+	timeout := time.NewTimer(50 * time.Millisecond)
+	defer timeout.Stop()
+
+	flush := func() {
+		if len(batch) == 0 || ctx.Err() != nil {
+			batch = batch[:0]
+			return
+		}
+		queryBatch(ctx, rpcClient, batch, resultCh, totalKeys, rpcErrors)
+		batch = batch[:0]
+		if !timeout.Stop() {
+			select {
+			case <-timeout.C:
+			default:
+			}
+		}
+		timeout.Reset(50 * time.Millisecond)
+	}
+
+	for {
+		select {
+		case ki, ok := <-keygenCh:
+			if !ok {
+				flush()
+				return
+			}
+			batch = append(batch, ki)
+			if len(batch) >= batchSize {
+				flush()
+			}
+		case <-timeout.C:
+			flush()
+			timeout.Reset(50 * time.Millisecond)
+		case <-ctx.Done():
+			flush()
+			return
+		}
+	}
+}
+
+// queryBatch sends a single JSON-RPC batch request for eth_getBalance on all
+// provided addresses and forwards accounts with non-zero balance to resultCh.
+func queryBatch(
+	ctx context.Context,
+	rpcClient *ethrpc.Client,
+	keys []keyInfo,
+	resultCh chan<- Account,
+	totalKeys *atomic.Int64,
+	rpcErrors *atomic.Int64,
+) {
+	elems := make([]ethrpc.BatchElem, len(keys))
+	results := make([]*string, len(keys))
+	for i := range keys {
+		s := new(string)
+		results[i] = s
+		elems[i] = ethrpc.BatchElem{
+			Method: "eth_getBalance",
+			Args:   []interface{}{keys[i].address, "latest"},
+			Result: s,
+		}
+	}
+
+	if err := rpcClient.BatchCallContext(ctx, elems); err != nil {
+		rpcErrors.Add(1)
+		return
+	}
+
+	totalKeys.Add(int64(len(keys)))
+
+	for i, elem := range elems {
+		if elem.Error != nil {
+			rpcErrors.Add(1)
+			continue
+		}
+		hexStr := *results[i]
+		wei := parseHexBalance(hexStr)
+		if wei == nil || wei.Sign() == 0 {
+			continue
+		}
+		ki := keys[i]
+		resultCh <- Account{
+			PrivateKey: hexutil.Encode(crypto.FromECDSA(ki.privateKey)),
+			PublicKey:  hexutil.Encode(ki.publicKeyBytes),
+			Address:    ki.address,
+			Balance:    weiToEther(wei),
+		}
+	}
+}
+
+// generateKeyInfo generates a new Ethereum key pair and returns the associated keyInfo.
+func generateKeyInfo() (keyInfo, error) {
+	privateKey, err := crypto.GenerateKey()
+	if err != nil {
+		return keyInfo{}, err
+	}
+	publicKeyECDSA, ok := privateKey.Public().(*ecdsa.PublicKey)
+	if !ok {
+		return keyInfo{}, fmt.Errorf("unexpected public key type")
+	}
+	return keyInfo{
+		privateKey:     privateKey,
+		publicKeyBytes: crypto.FromECDSAPub(publicKeyECDSA),
+		address:        crypto.PubkeyToAddress(*publicKeyECDSA).Hex(),
+	}, nil
+}
+
+// parseHexBalance parses a hex-encoded wei string (e.g. "0x1a") into a big.Int.
+// Returns nil for empty, "0x0", or unparseable values.
+func parseHexBalance(hexStr string) *big.Int {
+	if hexStr == "" || hexStr == "0x0" || hexStr == "0x" {
+		return nil
+	}
+	raw := hexStr
+	if len(raw) >= 2 && (raw[:2] == "0x" || raw[:2] == "0X") {
+		raw = raw[2:]
+	}
+	if raw == "" || raw == "0" {
+		return nil
+	}
+	wei := new(big.Int)
+	if _, ok := wei.SetString(raw, 16); !ok {
+		return nil
+	}
+	return wei
+}
+
+// weiPerEther is 10^18, computed once at startup.
+var weiPerEther = new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+
+// weiToEther converts a wei amount to ether as float64.
+func weiToEther(wei *big.Int) float64 {
+	if wei == nil {
+		return 0
+	}
+	result, _ := new(big.Float).Quo(
+		new(big.Float).SetInt(wei),
+		new(big.Float).SetInt(weiPerEther),
+	).Float64()
+	return result
 }
 
 func initDatabase(dbConfig databaseConfig) *gorm.DB {
@@ -238,13 +401,10 @@ func initDatabase(dbConfig databaseConfig) *gorm.DB {
 		AllowNativePasswords: true,
 	}
 
-	connectionString := configDB.FormatDSN()
-
-	var db *gorm.DB
-	var err error
-	if db, err = gorm.Open(sql.Open(connectionString), &gorm.Config{
+	db, err := gorm.Open(sqld.Open(configDB.FormatDSN()), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
-	}); err != nil {
+	})
+	if err != nil {
 		panic(err)
 	}
 
@@ -252,78 +412,4 @@ func initDatabase(dbConfig databaseConfig) *gorm.DB {
 		panic(err)
 	}
 	return db
-}
-
-func generatePrivateKey() (*ecdsa.PrivateKey, error) {
-	return crypto.GenerateKey()
-}
-
-func getAddressAndPublicKey(privateKey *ecdsa.PrivateKey) (string, []byte, error) {
-	publicKey := privateKey.Public()
-	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
-	if !ok {
-		return "", nil, fmt.Errorf("error generating public key")
-	}
-	publicKeyBytes := crypto.FromECDSAPub(publicKeyECDSA)
-	address := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
-	return address, publicKeyBytes, nil
-}
-
-func getAccountBalance(url string, address string) (float64, error) {
-	payload := map[string]interface{}{
-		"method":  "eth_getBalance",
-		"params":  []interface{}{address, "latest"},
-		"id":      1,
-		"jsonrpc": "2.0",
-	}
-
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return 0, err
-	}
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	resp, err := client.Post(url, "application/json", bytes.NewBuffer(payloadBytes))
-	if err != nil {
-		return 0, err
-	}
-	defer func(Body io.ReadCloser) {
-		_ = Body.Close()
-	}(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		//logrus.WithFields(logrus.Fields{"address": address, "url": url}).Warnf("got %d status code", resp.StatusCode)
-		time.Sleep(time.Second * 30)
-		return 0, fmt.Errorf("non-200 status code: %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-
-	var result map[string]interface{}
-	if err = json.Unmarshal(body, &result); err != nil {
-		return 0, err
-	}
-
-	var weiBalance string
-	if result["result"] != nil {
-		if str, ok := result["result"].(string); ok {
-			weiBalance = str
-		}
-	}
-
-	if weiBalance == "" {
-		return 0.00, nil
-	}
-
-	balanceInWei, err := strconv.ParseInt(weiBalance, 0, 64)
-	if err != nil {
-		return 0, err
-	}
-	balanceInEther := float64(balanceInWei) / math.Pow10(18)
-	return balanceInEther, nil
 }
